@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "osforge-terminal"
+version = "0.1.0"
+description = "A real cross-platform terminal launcher and host administration workbench"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "OS Forge contributors" }]
+dependencies = [
+  "rich>=13.7,<15",
+  "psutil>=5.9.8,<8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<9", "pytest-cov>=5,<7"]
+
+[project.scripts]
+osforge = "osforge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
