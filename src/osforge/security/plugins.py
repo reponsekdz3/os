@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 from typing import Any
 
 from osforge.security.contracts import AssessmentContext, PluginMetadata
@@ -59,11 +60,12 @@ def _validate_finding(item: Any, plugin_name: str) -> dict[str, Any]:
         if not value or len(value) > max_len:
             raise ValueError(f"Plugin {plugin_name!r} field {field!r} is empty or too long.")
         normalized[field] = value
-    if isinstance(normalized["evidence"], str):
-        if len(normalized["evidence"]) > 6000:
-            raise ValueError(f"Plugin {plugin_name!r} evidence is too long.")
-    elif not isinstance(normalized["evidence"], (dict, list, int, float, bool, type(None))):
-        raise ValueError(f"Plugin {plugin_name!r} evidence must be JSON-compatible.")
+    if isinstance(normalized["evidence"], str) and len(normalized["evidence"]) > 6000:
+        raise ValueError(f"Plugin {plugin_name!r} evidence is too long.")
+    try:
+        json.dumps(normalized["evidence"], ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Plugin {plugin_name!r} evidence must be JSON-compatible.") from exc
     normalized["severity"] = severity
     normalized["confidence"] = str(normalized.get("confidence", "medium")).lower()
     normalized["plugin"] = plugin_name

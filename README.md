@@ -111,16 +111,16 @@ See docs/SECURITY.md and tests/ for more details.
 The security assessment engine performs a bounded, evidence-focused review using only the active scope manifest:
 
     osforge security plugins
-    osforge security assess scope.json --output assessment.json
+    osforge security assess scope.json --approval scope.approval.json --output assessment.json
     osforge security history
     osforge security findings --status open
     osforge security remediate F-0123456789abcdef --status in_progress --assignee "IT Security" --due-date 2027-01-30
     osforge security finding-history F-0123456789abcdef
     osforge security audit-verify
 
-Before contacting any target, OS Forge asks for confirmation and displays the engagement reference, expiry, target/port counts, and hard runtime limits. A non-interactive run can use --yes only when the operator explicitly chooses to skip the interactive prompt.
+Before contacting any target, OS Forge verifies an Ed25519 signature from the configured trusted public key, checks the approval and scope expiry, asks for confirmation, and displays the approver, engagement reference, target/port counts, and hard runtime limits. Keep the encrypted private signing key on the approval workstation; distribute only the trusted public key to assessment operators. Key generation alone does not grant authorization authority. A non-interactive run can use --yes only when the operator explicitly chooses to skip the interactive prompt.
 
-Each assessment checks explicit targets and ports using TCP connection handshakes, and makes one HEAD request for each explicitly listed HTTP(S) URL. It does not follow redirects, crawl pages, authenticate, collect service banners, send exploit payloads, or make state-changing requests. URL queries and credentials are rejected to keep reports from storing accidental secrets. Network entries are capped at 256 addresses, the assessment is capped at 4096 TCP probes and 64 web URLs, and no more than eight TCP connection checks or four web HEAD checks are in flight. Scope expiry is checked before each connection.
+Each assessment checks explicit targets and ports using TCP connection handshakes, and makes one HEAD request for each explicitly listed HTTP(S) URL. It does not follow redirects, crawl pages, authenticate, collect service banners, send exploit payloads, or make state-changing requests. URL queries and credentials are rejected to keep reports from storing accidental secrets. Network entries are capped at 256 addresses, the assessment is capped at 4096 TCP probes and 64 web URLs, and no more than eight TCP checks or four web HEAD checks are in flight. Scope expiry is checked before each connection.
 
 Evidence is written to a JSON report. Run history, stable finding IDs, first/last-seen timestamps, severity, evidence, remediation guidance, assignee, due date, status, and status-change events are persisted in a local SQLite database under ~/.osforge/security-state.sqlite3 by default. Use --db to select a different state database, and --audit-log to choose an audit journal for an assessment. Statuses include open, in_progress, accepted_risk, false_positive, and resolved. Accepting risk, marking a false positive, or resolving a finding requires a review note. Findings that were resolved and are observed again are reopened.
 
@@ -138,6 +138,47 @@ Create a manifest from explicit approved values without contacting any device:
 
 Then, after confirming that the written authorization covers those exact targets and ports:
 
-    osforge security assess scope.json --output review.json
+    osforge security keygen --private-key approval-private.pem
+    osforge security scope-sign scope.json --private-key approval-private.pem --signer-id IT-Security-Approver --output scope.approval.json
+    osforge security trust-key-add trusted-approver-public.pem --signer-id IT-Security-Approver
+    osforge security trust-key-list
+    osforge security verify-approval scope.json --approval scope.approval.json
+    osforge security assess scope.json --approval scope.approval.json --output review.json
 
 The manifest is not a substitute for written authorization from the system owner. The sample target above is illustrative; replace it with only approved assets.
+
+
+### Signed authorization approvals
+
+Network assessment requires a detached Ed25519 approval signature. Generate a keypair on a controlled approval workstation, preserve the encrypted private key securely, and distribute the public key through a trusted configuration process. Review the written scope independently before signing it. The signature binds the exact scope JSON contents to a signer ID and expiry; modifying a target, port, URL, or authorization reference invalidates the signature.
+
+    osforge security keygen --private-key approval-private.pem
+    osforge security scope-sign scope.json --private-key approval-private.pem --signer-id IT-Security-Approver --output scope.approval.json
+    osforge security trust-key-add trusted-approver-public.pem --signer-id IT-Security-Approver
+    osforge security trust-key-list
+    osforge security verify-approval scope.json --approval scope.approval.json
+    osforge security assess scope.json --approval scope.approval.json
+
+The private-key passphrase is prompted interactively and is not accepted as a command-line argument. Assessment operators do not pass an arbitrary public key to each assessment: the signer ID in the approval is resolved against the system trust store. By default this is /etc/osforge/trusted-approvers on Linux/macOS and %ProgramData%/OSForge/trusted-approvers on Windows. Installing a key requires sufficient system permissions and does not auto-elevate. The CLI does not provide a per-run trust-store override; production deployments should manage the system store as administrator-owned configuration. A signer ID is descriptive metadata; trust derives from the public key installed by the organization. The signature does not replace written authorization or independently establish ownership.
+
+
+### Local code security scans and SBOM
+
+Use installed tools against a specific local source or project path:
+
+    osforge security local-scan . --engine bandit --output bandit-results.json
+    osforge security local-scan . --engine trivy --output trivy-results.json
+    osforge security sbom . --output software-inventory.cdx.json
+
+These commands ask for confirmation and reject URLs and network-share paths. Bandit checks Python source. Trivy checks local filesystem dependencies, misconfigurations, and secrets; it may download vulnerability data from the tool publisher, so outbound database requests can occur. Syft produces a CycloneDX software bill of materials. These tools are optional external programs; install trusted releases and review their licenses and update policies. A scanner result is evidence for review, not a guarantee that software is secure.
+
+The report destination must not already exist. Outputs use JSON, include scanner identity and exit code where relevant, and are recorded in the local audit journal.
+
+
+### Report integrity and exports
+
+    osforge security report-verify assessment.json
+    osforge security export assessment.json --format sarif --output assessment.sarif
+    osforge security export assessment.json --format csv --output findings.csv
+
+Assessment JSON includes a canonical SHA-256 integrity digest; report-verify detects edits to the report body. The digest is tamper-evident, not a digital signature—the local writer can recompute it. Assessment completion also records the output-file hash in the audit journal. SARIF 2.1.0 exports support integration with code-scanning workflows; CSV exports support spreadsheet and case-management imports. Export paths are not overwritten.

@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from osforge.security.audit import append_event
+from osforge.security.approval import verify_scope_approval
 from osforge.security.contracts import AssessmentContext
 from osforge.security.plugins import evaluate_plugins, validate_plugin_selection
 from osforge.security.scope import ScopeManifest, load_scope
@@ -81,6 +82,8 @@ def _safe_web_url(url: str) -> tuple[str, str, str, int]:
 def _resolve_exact_target(target: str) -> list[str]:
     if "/" in target:
         network = ipaddress.ip_network(target, strict=False)
+        if network.num_addresses == 1:
+            return [str(network.network_address)]
         return [str(host) for host in network.hosts()]
     try:
         return [str(ipaddress.ip_address(target))]
@@ -101,14 +104,14 @@ def _resolve_exact_target(target: str) -> list[str]:
     return addresses
 
 
-def _expand_assets(scope: ScopeManifest) -> tuple[list[dict[str, str]], list[dict[str, str]], dict[str, list[str]]]:
+def _expand_assets(scope: ScopeManifest, authorization_expires_at: datetime) -> tuple[list[dict[str, str]], list[dict[str, str]], dict[str, list[str]]]:
     assets: list[dict[str, str]] = []
     resolution_errors: list[dict[str, str]] = []
     target_addresses: dict[str, list[str]] = {}
     seen: set[tuple[str, str]] = set()
     for target in scope.targets:
-        if not scope.active:
-            raise ValueError("Authorization scope expired during asset resolution; assessment stopped.")
+        if _now() >= min(scope.expires_at, authorization_expires_at):
+            raise ValueError("Authorization or signed approval expired during asset resolution; assessment stopped.")
         try:
             addresses = _resolve_exact_target(target)
         except (OSError, ValueError) as exc:
@@ -131,15 +134,15 @@ def _expand_assets(scope: ScopeManifest) -> tuple[list[dict[str, str]], list[dic
     return assets, resolution_errors, target_addresses
 
 
-def _tcp_probe(asset: dict[str, str], port: int, timeout: float, expires_at: datetime) -> dict[str, Any]:
+def _tcp_probe(asset: dict[str, str], port: int, timeout: float, authorization_expires_at: datetime) -> dict[str, Any]:
     """Perform one bounded TCP connect; no protocol data is sent."""
     target = asset["target"]
     address = asset["address"]
-    if _now() >= expires_at:
+    if _now() >= authorization_expires_at:
         return {
             "target": target, "address": address, "port": port,
             "status": "not-probed-scope-expired", "service_hint": SERVICE_HINTS.get(port, "unknown"),
-            "latency_ms": 0.0, "error": "Authorization expired before probe started.",
+            "latency_ms": 0.0, "error": "Authorization or signed approval expired before probe started.",
         }
     started = time.perf_counter()
     try:
@@ -189,13 +192,14 @@ def _web_check(
     url: str,
     target_addresses: dict[str, list[str]],
     assets: list[dict[str, str]],
+    authorization_expires_at: datetime,
 ) -> dict[str, Any]:
     safe_url, scheme, host, port = _safe_web_url(url)
-    if not scope.active:
+    if _now() >= min(scope.expires_at, authorization_expires_at):
         return {
             "url": safe_url, "scheme": scheme, "port": port, "status_code": None,
             "headers": {}, "connected_ip": "", "tls_version": "", "error_kind": "scope-expired",
-            "error": "Authorization expired before the web check started.",
+            "error": "Authorization or signed approval expired before the web check started.",
         }
     if port not in scope.ports:
         raise ValueError(f"Web URL port {port} is not in the active scope's allowed ports.")
@@ -232,7 +236,14 @@ def _web_check(
         for key, value in response.getheaders():
             normalized = key.lower()
             if normalized in _SAFE_HEADERS:
-                headers[normalized] = value.strip()[:600]
+                safe_value = value.strip()[:600]
+                if normalized == "location":
+                    from urllib.parse import urljoin, urlsplit, urlunsplit
+                    parsed_location = urlsplit(urljoin(safe_url, safe_value))
+                    safe_value = urlunsplit((
+                        parsed_location.scheme, parsed_location.netloc, parsed_location.path or "/", "", ""
+                    ))[:600]
+                headers[normalized] = safe_value
         tls_version = ""
         certificate_sha256 = ""
         if scheme == "https" and connection.sock:
@@ -277,6 +288,8 @@ def _freeze(value: Any) -> Any:
 def run_assessment(
     scope_path: str | Path,
     *,
+    approval_path: str | Path,
+    approval_public_key_path: str | Path,
     output_path: str | Path = "osforge-assessment-report.json",
     database_path: str | Path | None = None,
     audit_path: str | Path | None = None,
@@ -285,7 +298,12 @@ def run_assessment(
     """Run the governed assessment workflow and persist findings/remediation state."""
     from osforge.security.state import record_assessment
 
+    destination = Path(output_path).expanduser().resolve()
+    if destination.exists():
+        raise ValueError(f"Refusing to overwrite existing assessment report: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
     scope = load_scope(scope_path, require_active=True)
+    approval = verify_scope_approval(scope_path, approval_path, approval_public_key_path)
     # Reject unknown extension names before making any network request.
     validate_plugin_selection(plugin_names)
     if len(scope.web_urls) > MAX_WEB_URLS:
@@ -303,20 +321,25 @@ def run_assessment(
             "target_entries": len(scope.targets),
             "ports": list(scope.ports),
             "plugins": list(plugin_names),
+            "approval_signer_id": approval["signer_id"],
+            "approval_scope_sha256": approval["scope_sha256"],
+            "approval_expires_at": approval["expires_at"],
         },
         path=audit_path,
     )
 
     try:
-        assets, resolution_errors, target_addresses = _expand_assets(scope)
+        approval_expiry = datetime.fromisoformat(approval["expires_at"])
+        effective_expiry = min(scope.expires_at, approval_expiry)
+        assets, resolution_errors, target_addresses = _expand_assets(scope, effective_expiry)
         probe_count = len(assets) * len(scope.ports)
         if probe_count > MAX_TCP_PROBES:
             raise ValueError(
                 f"Assessment would run {probe_count} TCP connection checks; the per-run ceiling is "
                 f"{MAX_TCP_PROBES}. Reduce explicitly approved targets or ports."
             )
-        if not scope.active:
-            raise ValueError("Authorization expired before the assessment started.")
+        if _now() >= effective_expiry:
+            raise ValueError("Authorization scope or signed approval expired before the assessment started.")
     except Exception as exc:
         append_event(
             "assessment.failed",
@@ -332,7 +355,7 @@ def run_assessment(
     observations: list[dict[str, Any]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = [
-            pool.submit(_tcp_probe, asset, port, 1.5, scope.expires_at)
+            pool.submit(_tcp_probe, asset, port, 1.5, effective_expiry)
             for asset in assets
             for port in scope.ports
         ]
@@ -346,7 +369,7 @@ def run_assessment(
             max_workers=min(MAX_WEB_WORKERS, len(scope.web_urls))
         ) as pool:
             futures = [
-                pool.submit(_web_check, scope, url, target_addresses, assets)
+                pool.submit(_web_check, scope, url, target_addresses, assets, effective_expiry)
                 for url in scope.web_urls
             ]
             for future in concurrent.futures.as_completed(futures):
@@ -387,6 +410,10 @@ def run_assessment(
         str(item.get("asset", "")), str(item.get("title", "")),
     ))
     now = _timestamp()
+    findings_by_severity = {
+        severity: sum(1 for item in findings if item.get("severity") == severity)
+        for severity in ("critical", "high", "medium", "low", "info")
+    }
     report: dict[str, Any] = {
         "schema_version": 1,
         "product": "OS Forge Security",
@@ -395,6 +422,7 @@ def run_assessment(
         "completed_at": now,
         "duration_seconds": round(time.perf_counter() - clock_started, 3),
         "plugins": ["tcp-exposure", "web-headers", *plugin_names],
+        "approval": {key: approval[key] for key in ("verified", "signer_id", "signed_at", "expires_at", "scope_sha256", "authorization_reference")},
         "engagement": {
             "name": scope.name, "owner": scope.owner,
             "authorization_reference": scope.authorization_reference,
@@ -417,6 +445,7 @@ def run_assessment(
             "tcp_no_response": sum(1 for row in observations if row["status"] == "no-response"),
             "web_urls_checked": len(web_observations),
             "findings_total": len(findings),
+            "findings_by_severity": findings_by_severity,
         },
         "assets": assets,
         "resolution_errors": resolution_errors,
@@ -433,18 +462,34 @@ def run_assessment(
         ],
     }
 
-    destination = Path(output_path).expanduser().resolve()
     report["report_path"] = str(destination)
+    if destination.exists():
+        raise ValueError(f"Assessment report path appeared during the run; refusing to overwrite: {destination}")
     report = record_assessment(report, database_path=database_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    report["summary"]["findings_by_status"] = {
+        status: sum(1 for item in report["findings"] if item.get("status") == status)
+        for status in ("open", "in_progress", "accepted_risk", "false_positive", "resolved")
+    }
+    canonical_report = json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    report["integrity"] = {
+        "algorithm": "SHA-256",
+        "canonicalization": "JSON sorted keys, compact separators, UTF-8; integrity field excluded",
+        "canonical_json_sha256": hashlib.sha256(canonical_report.encode("utf-8")).hexdigest(),
+    }
     temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+    if destination.exists():
+        temporary.unlink(missing_ok=True)
+        raise ValueError(f"Assessment report path appeared during the run; refusing to overwrite: {destination}")
     temporary.replace(destination)
+    report_sha256 = hashlib.sha256(destination.read_bytes()).hexdigest()
     append_event(
         "assessment.completed",
         details={
             "assessment_id": assessment_id,
             "report_path": str(destination),
+            "report_sha256": report_sha256,
+            "canonical_evidence_sha256": report["integrity"]["canonical_json_sha256"],
             "target_address_pairs": len(assets),
             "tcp_probes": len(observations),
             "findings_total": len(findings),

@@ -75,7 +75,7 @@ class ScopeManifest:
 
 
 def validate_scope_data(data: dict[str, Any], source_path: str = "", require_active: bool = True) -> ScopeManifest:
-    if not isinstance(data, dict) or data.get("schema_version") != 1:
+    if not isinstance(data, dict) or type(data.get("schema_version")) is not int or data.get("schema_version") != 1:
         raise ValueError("schema_version must be 1.")
     engagement = data.get("engagement")
     if not isinstance(engagement, dict):

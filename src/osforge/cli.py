@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import shlex
@@ -34,11 +35,14 @@ from osforge.processes import list_processes, listening_ports, process_identity,
 from osforge.system import doctor_checks, system_info
 from osforge.tools import TOOLS, discover_tools
 from osforge.security.audit import append_event, verify_log
+from osforge.security.approval import (approval_signer_id, default_trust_store_dir, generate_keypair, sign_scope, trust_public_key, trusted_public_key_path, verify_scope_approval)
 from osforge.security.assessment import run_assessment
 from osforge.security.catalog import discovered_tools, installed_security_extensions
 from osforge.security.posture import run_host_posture
 from osforge.security.plugins import discover_plugins, validate_plugin_selection
 from osforge.security.state import finding_history, list_assessments, list_findings, update_finding
+from osforge.security.local_tools import generate_sbom, run_local_scan
+from osforge.security.reporting import export_report, verify_assessment_report
 from osforge.security.scope import create_scope_manifest, load_scope
 
 console = Console()
@@ -106,6 +110,27 @@ def build_parser() -> argparse.ArgumentParser:
     security_parser = commands.add_parser("security", help="defensive security posture and local assessment tools")
     security_commands = security_parser.add_subparsers(dest="security_command", required=True)
 
+    keygen_parser = security_commands.add_parser("keygen", help="generate an Ed25519 key pair for approved scope signatures")
+    keygen_parser.add_argument("--private-key", required=True, help="new encrypted private key path")
+    keygen_parser.add_argument("--public-key", required=True, help="new public trust-anchor path")
+
+    sign_parser = security_commands.add_parser("scope-sign", help="sign a scope manifest after independent authorization review")
+    sign_parser.add_argument("scope_file")
+    sign_parser.add_argument("--private-key", required=True)
+    sign_parser.add_argument("--signer-id", required=True, help="organization approver identity or key ID")
+    sign_parser.add_argument("--expires-at", help="optional approval expiry, no later than scope expiry")
+    sign_parser.add_argument("--output", default="scope.approval.json")
+
+    approval_parser = security_commands.add_parser("verify-approval", help="verify a signed scope without contacting targets")
+    approval_parser.add_argument("scope_file")
+    approval_parser.add_argument("--approval", required=True)
+
+    trust_add_parser = security_commands.add_parser("trust-key-add", help="install an approver public key into the system trust store")
+    trust_add_parser.add_argument("public_key")
+    trust_add_parser.add_argument("--signer-id", required=True)
+
+    security_commands.add_parser("trust-key-list", help="list system-trusted approver key IDs")
+
     posture_parser = security_commands.add_parser("host-audit", help="run read-only local host posture checks")
     posture_parser.add_argument("--output", help="optional JSON report destination")
 
@@ -129,6 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     assess_parser = security_commands.add_parser("assess", help="run bounded checks against an active authorized scope")
     assess_parser.add_argument("scope_file", help="manifest listing approved targets, TCP ports, and optional web URLs")
+    assess_parser.add_argument("--approval", required=True, help="Ed25519 signed approval document")
     assess_parser.add_argument("--output", default="osforge-assessment-report.json", help="JSON evidence report path")
     assess_parser.add_argument("--db", help="remediation/history database path")
     assess_parser.add_argument("--audit-log", help="audit journal path")
@@ -157,6 +183,28 @@ def build_parser() -> argparse.ArgumentParser:
     finding_history_parser = security_commands.add_parser("finding-history", help="show status change history for one finding")
     finding_history_parser.add_argument("finding_id")
     finding_history_parser.add_argument("--db", help="remediation/history database path")
+
+    scan_parser = security_commands.add_parser("local-scan", help="run an installed analyzer against a selected local file or directory")
+    scan_parser.add_argument("path", help="local filesystem path; network shares and URLs are rejected")
+    scan_parser.add_argument("--engine", choices=("bandit", "trivy"), required=True)
+    scan_parser.add_argument("--output", default="osforge-local-scan.json")
+    scan_parser.add_argument("--timeout", type=int, default=300)
+    scan_parser.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+
+    sbom_parser = security_commands.add_parser("sbom", help="generate a CycloneDX inventory with installed Syft")
+    sbom_parser.add_argument("path", help="local filesystem path; network shares and URLs are rejected")
+    sbom_parser.add_argument("--output", default="osforge-sbom.cdx.json")
+    sbom_parser.add_argument("--timeout", type=int, default=180)
+    sbom_parser.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+
+    report_verify_parser = security_commands.add_parser("report-verify", help="verify the integrity digest of an OS Forge assessment report")
+    report_verify_parser.add_argument("report_path")
+    report_verify_parser.add_argument("--audit-log", help="optional matching audit journal path")
+
+    export_parser = security_commands.add_parser("export", help="export assessment findings to CSV or SARIF 2.1.0")
+    export_parser.add_argument("report_path")
+    export_parser.add_argument("--format", choices=("csv", "sarif"), required=True)
+    export_parser.add_argument("--output", required=True)
 
     commands.add_parser("shell", help="open your normal interactive system shell")
     return parser
@@ -401,6 +449,113 @@ def dispatch_security(args: argparse.Namespace) -> int:
             console.print("[dim]Discovery does not import or execute third-party extension code.[/dim]")
             return 0
 
+        if command == "trust-key-add":
+            console.print(Panel(
+                f"Approver signer ID: [bright_cyan]{args.signer_id}[/bright_cyan]\n"
+                f"Public key file: {Path(args.public_key).expanduser().resolve()}\n"
+                f"System trust store: {default_trust_store_dir()}",
+                title="INSTALL APPROVAL TRUST ANCHOR",
+                border_style="yellow",
+            ))
+            console.print("[yellow]Installing a public key changes which signatures are trusted. Use only a key delivered through your organization's independent approval process. This command never elevates permissions.[/yellow]")
+            if not Confirm.ask("Do you trust this approver key for this machine?", default=False):
+                console.print("[yellow]Trust-key installation cancelled.[/yellow]")
+                return 0
+            installed = trust_public_key(args.public_key, signer_id=args.signer_id)
+            append_event("approval-trust-key.installed", details={
+                "signer_id": args.signer_id, "path": str(installed),
+            })
+            console.print(f"[green]Trusted public key installed:[/green] {installed}")
+            return 0
+
+        if command == "trust-key-list":
+            directory = default_trust_store_dir()
+            table = Table(title="SYSTEM TRUSTED APPROVERS", box=box.SIMPLE_HEAVY)
+            table.add_column("SIGNER ID", style="bright_cyan")
+            table.add_column("PUBLIC KEY FILE")
+            if directory.is_dir():
+                for key_file in sorted(directory.glob("*.pem")):
+                    table.add_row(key_file.stem, str(key_file))
+            console.print(table)
+            console.print(f"Trust store: {directory}")
+            console.print("[dim]If the trust store is empty, ask an administrator to install an organization-approved public key.[/dim]")
+            return 0
+
+        if command == "keygen":
+            passphrase = getpass.getpass("Private-key passphrase (minimum 12 characters): ")
+            repeated = getpass.getpass("Repeat passphrase: ")
+            if passphrase != repeated:
+                raise ValueError("Passphrases do not match.")
+            private_path, public_path = generate_keypair(
+                args.private_key, args.public_key, passphrase=passphrase,
+            )
+            append_event("approval-keypair.created", details={
+                "private_key_path": str(private_path),
+                "public_key_path": str(public_path),
+                "algorithm": "Ed25519",
+            })
+            console.print(Panel(
+                f"Private key: [bright_cyan]{private_path}[/bright_cyan]\n"
+                f"Public trust key: {public_path}\nAlgorithm: Ed25519",
+                title="SCOPE-APPROVAL KEY PAIR CREATED",
+                border_style="bright_green",
+            ))
+            console.print("[yellow]Keep the private key off assessment hosts. Configure the public key through your organization's trusted deployment process; generating a key does not itself grant approval authority.[/yellow]")
+            return 0
+
+        if command == "scope-sign":
+            scope = load_scope(args.scope_file, require_active=True)
+            console.print(Panel(
+                f"Engagement: [bright_cyan]{scope.name}[/bright_cyan]\n"
+                f"Owner: {scope.owner}\nAuthorization reference: {scope.authorization_reference}\n"
+                f"Targets: {len(scope.targets)} | ports: {len(scope.ports)} | web URLs: {len(scope.web_urls)}\n"
+                f"Expires: {scope.expires_at.isoformat()}",
+                title="SCOPE SIGNING / REVIEW REQUIRED",
+                border_style="yellow",
+            ))
+            console.print("[yellow]Only sign after independently confirming the owner's written approval for these exact targets and ports.[/yellow]")
+            if not Confirm.ask("Have you reviewed the written authorization for this exact scope?", default=False):
+                console.print("[yellow]Signing cancelled.[/yellow]")
+                return 0
+            passphrase = getpass.getpass("Private-key passphrase: ")
+            result = sign_scope(
+                args.scope_file, args.private_key,
+                signer_id=args.signer_id, passphrase=passphrase,
+                output_path=args.output, expires_at=args.expires_at,
+            )
+            append_event("scope.signed", details={
+                "authorization_reference": scope.authorization_reference,
+                "signer_id": result["signer_id"],
+                "scope_sha256": result["scope_sha256"],
+                "approval_path": result["approval_path"],
+            })
+            console.print(Panel(
+                f"Signed approval: [bright_cyan]{result['approval_path']}[/bright_cyan]\n"
+                f"Signer: {result['signer_id']}\nExpires: {result['expires_at']}\n"
+                f"Scope SHA-256: {result['scope_sha256']}",
+                title="SCOPE APPROVAL SIGNED",
+                border_style="bright_green",
+            ))
+            return 0
+
+        if command == "verify-approval":
+            signer_id = approval_signer_id(args.approval)
+            public_key_path = trusted_public_key_path(signer_id)
+            result = verify_scope_approval(args.scope_file, args.approval, public_key_path)
+            append_event("scope.approval.verified", details={
+                "authorization_reference": result["authorization_reference"],
+                "signer_id": result["signer_id"],
+                "scope_sha256": result["scope_sha256"],
+            })
+            console.print(Panel(
+                f"Status: [green]VERIFIED[/green]\nSigner: {result['signer_id']}\n"
+                f"Authorization reference: {result['authorization_reference']}\n"
+                f"Expiry: {result['expires_at']}\nScope SHA-256: {result['scope_sha256']}",
+                title="SIGNED SCOPE APPROVAL",
+                border_style="bright_green",
+            ))
+            return 0
+
         if command == "scope-init":
             destination = create_scope_manifest(
                 args.scope_file,
@@ -473,6 +628,20 @@ def dispatch_security(args: argparse.Namespace) -> int:
 
         if command == "assess":
             scope = load_scope(args.scope_file, require_active=True)
+            signer_id = ""
+            try:
+                signer_id = approval_signer_id(args.approval)
+                approval_key_path = trusted_public_key_path(signer_id)
+                approval_result = verify_scope_approval(args.scope_file, args.approval, approval_key_path)
+            except (ValueError, OSError) as exc:
+                append_event("assessment.authorization_rejected", details={
+                    "scope_file": str(Path(args.scope_file).expanduser()),
+                    "approval_file": str(Path(args.approval).expanduser()),
+                    "requested_signer_id": signer_id or "unreadable",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:500],
+                }, path=args.audit_log)
+                raise
             validate_plugin_selection(tuple(args.plugin))
             external = [
                 plugin for plugin in discover_plugins()
@@ -482,6 +651,7 @@ def dispatch_security(args: argparse.Namespace) -> int:
                 f"Engagement: [bright_cyan]{scope.name}[/bright_cyan]\n"
                 f"Owner: {scope.owner}\nAuthorization reference: {scope.authorization_reference}\n"
                 f"Expires: {scope.expires_at.isoformat()}\n"
+                f"Signed approval: VERIFIED by {approval_result['signer_id']} until {approval_result['expires_at']}\n"
                 f"Target entries: {len(scope.targets)} | allowed TCP ports: {len(scope.ports)} | "
                 f"explicit web URLs: {len(scope.web_urls)}\n"
                 "Limits: max 256 target/address pairs, 4096 TCP checks, 8 TCP workers, 4 web workers, "
@@ -501,6 +671,8 @@ def dispatch_security(args: argparse.Namespace) -> int:
                 return 0
             report = run_assessment(
                 args.scope_file,
+                approval_path=args.approval,
+                approval_public_key_path=approval_key_path,
                 output_path=args.output,
                 database_path=args.db,
                 audit_path=args.audit_log,
@@ -603,6 +775,82 @@ def dispatch_security(args: argparse.Namespace) -> int:
                 f"Status: {result['status']}\nAssignee: {result['assignee'] or '—'}\n"
                 f"Due date: {result['due_date'] or '—'}",
                 title="REMEDIATION STATE UPDATED",
+                border_style="bright_green",
+            ))
+            return 0
+
+        if command == "local-scan":
+            target = args.path
+            action = f"run local {args.engine} security analysis against {target}"
+            console.print("[yellow]This scan is local-only, but the selected scanner can inspect source and dependency metadata. Trivy may contact its vulnerability databases.[/yellow]")
+            if not _require_confirmation(action, bool(args.yes)):
+                console.print("[yellow]Local scan cancelled.[/yellow]")
+                return 0
+            append_event("local-scan.started", details={"engine": args.engine, "target": str(Path(target).expanduser())})
+            report = run_local_scan(
+                target, engine=args.engine, output_path=args.output, timeout_seconds=args.timeout,
+            )
+            append_event("local-scan.completed", details={
+                "engine": args.engine, "target": report["target"],
+                "exit_code": report["exit_code"], "report_path": report["report_path"],
+                "parse_error": report.get("parse_error"),
+            })
+            console.print(Panel(
+                f"Engine: [bright_cyan]{report['engine']}[/bright_cyan]\n"
+                f"Target: {report['target']}\nScanner exit: {report['exit_code']}\n"
+                f"Report: {report['report_path']}\n"
+                f"JSON parsed: {'yes' if report.get('parse_error') is None else 'no'}",
+                title="LOCAL SECURITY SCAN",
+                border_style="bright_green" if report.get("parse_error") is None else "yellow",
+            ))
+            if report.get("parse_error"):
+                console.print(f"[yellow]{report['parse_error']}[/yellow]")
+                if report.get("stderr"):
+                    console.print(report["stderr"][:3000])
+                return 1
+            console.print("[dim]Interpret scanner results manually; a clean scan is not proof of security.[/dim]")
+            # Bandit can use exit code 1 to mean findings were detected; the JSON report remains valid.
+            return 0
+
+        if command == "report-verify":
+            result = verify_assessment_report(args.report_path, audit_path=args.audit_log)
+            console.print(Panel(
+                f"Status: [green]VERIFIED[/green]\n"
+                f"Assessment: {result['assessment_id']}\n"
+                f"Findings: {result['findings_total']}\n"
+                f"Canonical SHA-256: {result['canonical_json_sha256']}\n"
+                f"Audit record match: {result['audit_record_match']}\n{result['audit_message']}",
+                title="ASSESSMENT REPORT INTEGRITY",
+                border_style="bright_green",
+            ))
+            return 0
+
+        if command == "export":
+            result = export_report(args.report_path, output_path=args.output, format=args.format)
+            append_event("assessment.report.exported", details=result)
+            console.print(Panel(
+                f"Format: [bright_cyan]{result['format']}[/bright_cyan]\n"
+                f"Assessment: {result['assessment_id']}\n"
+                f"Findings exported: {result['findings_exported']}\n"
+                f"Output: {result['output_path']}",
+                title="ASSESSMENT REPORT EXPORTED",
+                border_style="bright_green",
+            ))
+            return 0
+
+        if command == "sbom":
+            action = f"generate a CycloneDX software inventory for local path {args.path}"
+            if not _require_confirmation(action, bool(args.yes)):
+                console.print("[yellow]SBOM generation cancelled.[/yellow]")
+                return 0
+            append_event("sbom.started", details={"target": str(Path(args.path).expanduser())})
+            result = generate_sbom(args.path, output_path=args.output, timeout_seconds=args.timeout)
+            append_event("sbom.completed", details=result)
+            console.print(Panel(
+                f"Tool: [bright_cyan]{result['tool']}[/bright_cyan]\n"
+                f"Target: {result['target']}\nComponents: {result['component_count']}\n"
+                f"Report: {result['report_path']}",
+                title="SOFTWARE BILL OF MATERIALS",
                 border_style="bright_green",
             ))
             return 0

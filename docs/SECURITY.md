@@ -50,3 +50,30 @@ Risk acceptance, false-positive classification, and resolution require review no
 ## Plugin execution model
 
 Built-in rules process only the observations provided by the assessment engine. Third-party plugins register through the osforge.security_checks Python entry-point group. Discovery inspects plugin metadata only. An external plugin is loaded only when the operator names it explicitly and confirms the assessment. The plugin receives a recursively read-only evidence context, but Python plugins are not sandboxed: imported code still runs with the OS Forge user's privileges. Only install reviewed distributions from trusted sources.
+
+
+## Cryptographically signed approval
+
+Remote network assessment requires an Ed25519 signature over the canonicalized scope manifest. Key generation creates an encrypted private key and matching public key; it does not create organizational authority. Deploy only a public key trusted through your organization's out-of-band approval process to assessment operators. Keep the private key with designated approvers.
+
+The scope signing command prompts for the private-key passphrase and requires an interactive confirmation that the written authorization has been reviewed. Approval verification checks the signature, exact scope digest, authorization reference, signing timestamp, and expiry. The assessment library repeats verification immediately before target resolution and checks the earlier of scope expiry and signed approval expiry before each target resolution, TCP connection, and web request.
+
+A trusted key still cannot prove ownership of a target or legal permission by itself. The organization must control the private key, access to it, approval policy, revocation, and distribution of public trust anchors. Key rotation and revocation distribution are operational responsibilities in this release.
+
+
+## Local source and software inventory checks
+
+The local-scan command invokes only the selected allowlisted analyzer against the path supplied by the operator:
+
+    osforge security local-scan . --engine bandit --output bandit-results.json
+    osforge security local-scan . --engine trivy --output trivy-results.json
+    osforge security sbom . --output software-inventory.cdx.json
+
+The selected scanner must already be installed and on PATH. OS Forge rejects URL/UNC/network-share targets, asks for confirmation, invokes exact argument arrays without a shell, applies a timeout, caps captured report size, and writes a JSON report or CycloneDX SBOM. Trivy may contact its published vulnerability databases. Scanner-specific output and accuracy remain the responsibility of the upstream scanner.
+
+
+## Trust-store enforcement
+
+The CLI does not accept an arbitrary public key on each assessment command. It reads the signer ID from the approval document and resolves that ID in the system trust store: /etc/osforge/trusted-approvers on Linux/macOS, or %ProgramData%/OSForge/trusted-approvers on Windows. Only public keys in that store are accepted by the CLI. Installing a key requires write access to this system directory; OS Forge never auto-elevates. The CLI does not provide a per-run trust-store override.
+
+Organizations must install trusted keys using an administrator-controlled deployment process and protect the private signing key separately. The trust-key-add command prompts for confirmation but cannot independently verify the provenance of the public key, so an operator must compare its fingerprint through an independent trusted channel. A user who can change the trust store, override its directory, or run arbitrary code as the assessment account can bypass local controls; production enforcement therefore depends on operating-system permissions and centrally managed configuration.
