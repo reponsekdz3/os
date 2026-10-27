@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shlex
+import sqlite3
 import shutil
 import subprocess
 import sys
@@ -33,9 +34,12 @@ from osforge.processes import list_processes, listening_ports, process_identity,
 from osforge.system import doctor_checks, system_info
 from osforge.tools import TOOLS, discover_tools
 from osforge.security.audit import append_event, verify_log
+from osforge.security.assessment import run_assessment
 from osforge.security.catalog import discovered_tools, installed_security_extensions
 from osforge.security.posture import run_host_posture
-from osforge.security.scope import load_scope
+from osforge.security.plugins import discover_plugins, validate_plugin_selection
+from osforge.security.state import finding_history, list_assessments, list_findings, update_finding
+from osforge.security.scope import create_scope_manifest, load_scope
 
 console = Console()
 BUILTINS = {
@@ -107,11 +111,52 @@ def build_parser() -> argparse.ArgumentParser:
 
     security_commands.add_parser("tools", help="show detected defensive security tools and extensions")
 
+    init_scope_parser = security_commands.add_parser("scope-init", help="create a validated scope manifest without contacting targets")
+    init_scope_parser.add_argument("scope_file")
+    init_scope_parser.add_argument("--name", required=True)
+    init_scope_parser.add_argument("--owner", required=True)
+    init_scope_parser.add_argument("--authorization-reference", required=True)
+    init_scope_parser.add_argument("--expires-at", required=True, help="ISO-8601 date/time with timezone, e.g. 2027-01-30T18:00:00Z")
+    init_scope_parser.add_argument("--target", action="append", required=True, help="exact approved hostname, IP, or bounded CIDR; repeat per target")
+    init_scope_parser.add_argument("--port", action="append", required=True, type=int, help="explicit approved TCP port; repeat per port")
+    init_scope_parser.add_argument("--web-url", action="append", default=[], help="exact approved HTTP(S) URL without query or credentials")
+
     scope_parser = security_commands.add_parser("validate-scope", help="validate an authorization manifest without contacting targets")
     scope_parser.add_argument("scope_file", help="JSON file documenting approved targets, ports, owner, and expiry")
 
     audit_parser = security_commands.add_parser("audit-verify", help="verify the local hash-linked audit journal")
     audit_parser.add_argument("--path", help="optional audit log path; defaults to ~/.osforge/security-audit.jsonl")
+
+    assess_parser = security_commands.add_parser("assess", help="run bounded checks against an active authorized scope")
+    assess_parser.add_argument("scope_file", help="manifest listing approved targets, TCP ports, and optional web URLs")
+    assess_parser.add_argument("--output", default="osforge-assessment-report.json", help="JSON evidence report path")
+    assess_parser.add_argument("--db", help="remediation/history database path")
+    assess_parser.add_argument("--audit-log", help="audit journal path")
+    assess_parser.add_argument("--plugin", action="append", default=[], help="explicitly opt in to an installed check plugin; may be repeated")
+    assess_parser.add_argument("--yes", action="store_true", help="confirm assessment and any selected third-party plugin in non-interactive use")
+
+    plugins_parser = security_commands.add_parser("plugins", help="list built-in and installed check plugins")
+    findings_parser = security_commands.add_parser("findings", help="list persistent findings and their remediation state")
+    findings_parser.add_argument("--status", choices=("open", "in_progress", "accepted_risk", "false_positive", "resolved"))
+    findings_parser.add_argument("--limit", type=int, default=100)
+    findings_parser.add_argument("--db", help="remediation/history database path")
+
+    history_parser = security_commands.add_parser("history", help="list past assessment runs")
+    history_parser.add_argument("--limit", type=int, default=20)
+    history_parser.add_argument("--db", help="remediation/history database path")
+
+    remediate_parser = security_commands.add_parser("remediate", help="update finding status, owner, due date, and review note")
+    remediate_parser.add_argument("finding_id")
+    remediate_parser.add_argument("--status", choices=("open", "in_progress", "accepted_risk", "false_positive", "resolved"), required=True)
+    remediate_parser.add_argument("--note", default="", help="required when accepting risk, marking false positive, or resolving")
+    remediate_parser.add_argument("--assignee")
+    remediate_parser.add_argument("--due-date", help="YYYY-MM-DD")
+    remediate_parser.add_argument("--db", help="remediation/history database path")
+    remediate_parser.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+
+    finding_history_parser = security_commands.add_parser("finding-history", help="show status change history for one finding")
+    finding_history_parser.add_argument("finding_id")
+    finding_history_parser.add_argument("--db", help="remediation/history database path")
 
     commands.add_parser("shell", help="open your normal interactive system shell")
     return parser
@@ -356,6 +401,36 @@ def dispatch_security(args: argparse.Namespace) -> int:
             console.print("[dim]Discovery does not import or execute third-party extension code.[/dim]")
             return 0
 
+        if command == "scope-init":
+            destination = create_scope_manifest(
+                args.scope_file,
+                name=args.name,
+                owner=args.owner,
+                authorization_reference=args.authorization_reference,
+                expires_at=args.expires_at,
+                targets=args.target,
+                ports=args.port,
+                web_urls=args.web_url,
+            )
+            scope = load_scope(destination, require_active=True)
+            append_event("scope-created", details={
+                "scope_file": str(destination),
+                "authorization_reference": scope.authorization_reference,
+                "target_count": len(scope.targets),
+                "port_count": len(scope.ports),
+            })
+            console.print(Panel(
+                f"Scope file: [bright_cyan]{destination}[/bright_cyan]\n"
+                f"Engagement: {scope.name}\nOwner: {scope.owner}\n"
+                f"Authorization reference: {scope.authorization_reference}\n"
+                f"Expiry: {scope.expires_at.isoformat()}\n"
+                f"Targets: {len(scope.targets)} | ports: {len(scope.ports)} | web URLs: {len(scope.web_urls)}",
+                title="AUTHORIZATION MANIFEST CREATED",
+                border_style="bright_green",
+            ))
+            console.print("[yellow]This command only writes a manifest; it does not contact any listed target or independently verify permission.[/yellow]")
+            return 0
+
         if command == "validate-scope":
             scope = load_scope(args.scope_file, require_active=True)
             append_event("scope-validated", details={
@@ -379,6 +454,175 @@ def dispatch_security(args: argparse.Namespace) -> int:
             console.print("[yellow]Validation checks the manifest's structure and expiry only; it does not prove ownership or consent.[/yellow]")
             return 0
 
+        if command == "plugins":
+            table = Table(title="OS FORGE SECURITY PLUGINS", box=box.SIMPLE_HEAVY)
+            table.add_column("NAME", style="bright_cyan")
+            table.add_column("VERSION")
+            table.add_column("SOURCE")
+            table.add_column("TRUST")
+            table.add_column("DESCRIPTION", overflow="fold")
+            for plugin in discover_plugins():
+                table.add_row(
+                    plugin.name, plugin.version, plugin.source,
+                    "[green]BUILT-IN[/green]" if plugin.trusted else "[yellow]EXTERNAL / OPT-IN[/yellow]",
+                    plugin.description,
+                )
+            console.print(table)
+            console.print("[yellow]Third-party plugins execute Python code with your account's privileges when selected. Review and trust their source first.[/yellow]")
+            return 0
+
+        if command == "assess":
+            scope = load_scope(args.scope_file, require_active=True)
+            validate_plugin_selection(tuple(args.plugin))
+            external = [
+                plugin for plugin in discover_plugins()
+                if plugin.name in set(args.plugin) and not plugin.trusted
+            ]
+            console.print(Panel(
+                f"Engagement: [bright_cyan]{scope.name}[/bright_cyan]\n"
+                f"Owner: {scope.owner}\nAuthorization reference: {scope.authorization_reference}\n"
+                f"Expires: {scope.expires_at.isoformat()}\n"
+                f"Target entries: {len(scope.targets)} | allowed TCP ports: {len(scope.ports)} | "
+                f"explicit web URLs: {len(scope.web_urls)}\n"
+                "Limits: max 256 target/address pairs, 4096 TCP checks, 8 TCP workers, 4 web workers, "
+                "one HEAD request per web URL.",
+                title="AUTHORIZED ASSESSMENT REVIEW",
+                border_style="yellow",
+            ))
+            console.print("[yellow]Only targets and TCP ports in this unexpired manifest will be contacted. This tool does not prove that the manifest's author has legal permission.[/yellow]")
+            if external:
+                console.print("[bold red]THIRD-PARTY PLUGIN CODE WILL EXECUTE:[/bold red] " + ", ".join(p.name for p in external))
+                console.print("Review the plugin distribution and its source before proceeding.")
+            if not _require_confirmation(
+                f"run low-impact assessment for authorization reference {scope.authorization_reference}",
+                bool(args.yes),
+            ):
+                console.print("[yellow]Assessment cancelled; no target checks were started.[/yellow]")
+                return 0
+            report = run_assessment(
+                args.scope_file,
+                output_path=args.output,
+                database_path=args.db,
+                audit_path=args.audit_log,
+                plugin_names=tuple(args.plugin),
+            )
+            counts = {}
+            for finding in report["findings"]:
+                counts[finding["severity"]] = counts.get(finding["severity"], 0) + 1
+            table = Table(title="ASSESSMENT RESULTS", box=box.ROUNDED, border_style="bright_green")
+            table.add_column("METRIC", style="bright_cyan")
+            table.add_column("VALUE")
+            table.add_row("Assessment ID", report["assessment_id"])
+            table.add_row("TCP probes", str(report["summary"]["tcp_probes"]))
+            table.add_row("Open TCP ports", str(report["summary"]["tcp_open"]))
+            table.add_row("Web URLs checked", str(report["summary"]["web_urls_checked"]))
+            table.add_row("Findings", str(report["summary"]["findings_total"]))
+            table.add_row("Remediation database", report.get("remediation", {}).get("database_path", ""))
+            table.add_row("Evidence report", report["report_path"])
+            console.print(table)
+            if counts:
+                findings_table = Table(title="FINDINGS / INITIAL REMEDIATION STATE", box=box.SIMPLE_HEAVY)
+                findings_table.add_column("ID", style="bright_cyan")
+                findings_table.add_column("SEVERITY")
+                findings_table.add_column("STATUS")
+                findings_table.add_column("ASSET")
+                findings_table.add_column("FINDING", overflow="fold")
+                for finding in report["findings"]:
+                    findings_table.add_row(
+                        finding.get("finding_id", ""), finding["severity"].upper(),
+                        finding.get("status", "open"), finding["asset"], finding["title"],
+                    )
+                console.print(findings_table)
+            if report.get("plugin_errors"):
+                console.print("[yellow]One or more selected checks failed; see plugin_errors in the report.[/yellow]")
+            console.print("[dim]An open port is evidence of reachability, not proof of a vulnerability. Review each finding and remediation recommendation.[/dim]")
+            return 0
+
+        if command == "findings":
+            rows = list_findings(database_path=args.db, status=args.status, limit=args.limit)
+            table = Table(title="FINDINGS / REMEDIATION QUEUE", box=box.SIMPLE_HEAVY)
+            table.add_column("ID", style="bright_cyan")
+            table.add_column("SEVERITY")
+            table.add_column("STATUS")
+            table.add_column("ASSIGNEE")
+            table.add_column("DUE")
+            table.add_column("ASSET", overflow="fold")
+            table.add_column("TITLE", overflow="fold")
+            for item in rows:
+                table.add_row(
+                    item["finding_id"], item["severity"].upper(), item["status"],
+                    item["assignee"] or "—", item["due_date"] or "—", item["asset"], item["title"],
+                )
+            console.print(table)
+            console.print(f"{len(rows)} finding record(s) shown.")
+            return 0
+
+        if command == "history":
+            rows = list_assessments(database_path=args.db, limit=args.limit)
+            table = Table(title="ASSESSMENT HISTORY", box=box.SIMPLE_HEAVY)
+            table.add_column("COMPLETED", style="bright_cyan")
+            table.add_column("ASSESSMENT")
+            table.add_column("ENGAGEMENT")
+            table.add_column("TARGETS", justify="right")
+            table.add_column("TCP PROBES", justify="right")
+            table.add_column("FINDINGS", justify="right")
+            table.add_column("REPORT", overflow="fold")
+            for item in rows:
+                table.add_row(
+                    item["completed_at"], item["assessment_id"], item["scope_name"],
+                    str(item["target_count"]), str(item["tcp_probe_count"]),
+                    str(item["finding_count"]), item["report_path"],
+                )
+            console.print(table)
+            console.print(f"{len(rows)} assessment run(s) shown.")
+            return 0
+
+        if command == "remediate":
+            if not _require_confirmation(
+                f"change finding {args.finding_id} to status {args.status}",
+                bool(args.yes),
+            ):
+                console.print("[yellow]Remediation update cancelled.[/yellow]")
+                return 0
+            old_items = list_findings(database_path=args.db, limit=1000)
+            old = next((item for item in old_items if item["finding_id"] == args.finding_id), None)
+            result = update_finding(
+                args.finding_id, status=args.status, note=args.note,
+                assignee=args.assignee, due_date=args.due_date, database_path=args.db,
+            )
+            append_event("finding.status.changed", details={
+                "finding_id": args.finding_id,
+                "previous_status": old["status"] if old else "unknown",
+                "new_status": result["status"],
+                "assignee": result["assignee"],
+                "due_date": result["due_date"],
+                "note": args.note[:500],
+            })
+            console.print(Panel(
+                f"Finding: [bright_cyan]{result['finding_id']}[/bright_cyan]\n"
+                f"Status: {result['status']}\nAssignee: {result['assignee'] or '—'}\n"
+                f"Due date: {result['due_date'] or '—'}",
+                title="REMEDIATION STATE UPDATED",
+                border_style="bright_green",
+            ))
+            return 0
+
+        if command == "finding-history":
+            rows = finding_history(args.finding_id, database_path=args.db)
+            table = Table(title=f"FINDING HISTORY / {args.finding_id}", box=box.SIMPLE_HEAVY)
+            table.add_column("WHEN", style="bright_cyan")
+            table.add_column("ACTOR")
+            table.add_column("FROM")
+            table.add_column("TO")
+            table.add_column("NOTE", overflow="fold")
+            for item in rows:
+                table.add_row(
+                    item["event_at"], item["actor"], item["old_status"] or "—",
+                    item["new_status"], item["note"],
+                )
+            console.print(table)
+            return 0
+
         if command == "audit-verify":
             valid, count, message = verify_log(args.path)
             if valid:
@@ -388,7 +632,7 @@ def dispatch_security(args: argparse.Namespace) -> int:
             return 1
         console.print("[red]Unknown security command.[/red]")
         return 2
-    except (ValueError, RuntimeError, PermissionError, OSError) as exc:
+    except (ValueError, RuntimeError, PermissionError, OSError, sqlite3.Error) as exc:
         console.print(f"[bold red]SECURITY ERROR[/bold red] {exc}")
         return 1
 

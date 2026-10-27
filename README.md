@@ -104,3 +104,40 @@ Security utilities are discovered by capability and availability. Future plugins
 - A clean report is not proof that a system is secure.
 
 See docs/SECURITY.md and tests/ for more details.
+
+
+## Authorized assessment workflow
+
+The security assessment engine performs a bounded, evidence-focused review using only the active scope manifest:
+
+    osforge security plugins
+    osforge security assess scope.json --output assessment.json
+    osforge security history
+    osforge security findings --status open
+    osforge security remediate F-0123456789abcdef --status in_progress --assignee "IT Security" --due-date 2027-01-30
+    osforge security finding-history F-0123456789abcdef
+    osforge security audit-verify
+
+Before contacting any target, OS Forge asks for confirmation and displays the engagement reference, expiry, target/port counts, and hard runtime limits. A non-interactive run can use --yes only when the operator explicitly chooses to skip the interactive prompt.
+
+Each assessment checks explicit targets and ports using TCP connection handshakes, and makes one HEAD request for each explicitly listed HTTP(S) URL. It does not follow redirects, crawl pages, authenticate, collect service banners, send exploit payloads, or make state-changing requests. URL queries and credentials are rejected to keep reports from storing accidental secrets. Network entries are capped at 256 addresses, the assessment is capped at 4096 TCP probes and 64 web URLs, and no more than eight TCP connection checks or four web HEAD checks are in flight. Scope expiry is checked before each connection.
+
+Evidence is written to a JSON report. Run history, stable finding IDs, first/last-seen timestamps, severity, evidence, remediation guidance, assignee, due date, status, and status-change events are persisted in a local SQLite database under ~/.osforge/security-state.sqlite3 by default. Use --db to select a different state database, and --audit-log to choose an audit journal for an assessment. Statuses include open, in_progress, accepted_risk, false_positive, and resolved. Accepting risk, marking a false positive, or resolving a finding requires a review note. Findings that were resolved and are observed again are reopened.
+
+The built-in evidence rules identify reachable management/data-service ports and review a limited set of HTTP security headers. An open port or missing header is an observation for human triage, not conclusive proof of a vulnerability. The platform records this limitation explicitly.
+
+Third-party plugins implement the contract in docs/PLUGINS.md. Discovery only inspects metadata. Plugins are loaded only when explicitly selected with --plugin; they execute in-process with the current user's privileges and are not sandboxed, so review their source before trusting them.
+
+
+### Create and validate a scope file
+
+Create a manifest from explicit approved values without contacting any device:
+
+    osforge security scope-init scope.json --name "Office network review" --owner "IT Security" --authorization-reference CHANGE-1234 --expires-at 2027-01-30T18:00:00Z --target 192.168.1.10 --port 22 --port 80 --port 443 --web-url https://192.168.1.10
+    osforge security validate-scope scope.json
+
+Then, after confirming that the written authorization covers those exact targets and ports:
+
+    osforge security assess scope.json --output review.json
+
+The manifest is not a substitute for written authorization from the system owner. The sample target above is illustrative; replace it with only approved assets.

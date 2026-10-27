@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-MAX_TARGETS = 1024
-MAX_PORTS = 128
+MAX_TARGETS = 256
+MAX_PORTS = 64
 _DOMAIN_LABEL = re.compile(r"^(?=.{1,63}$)[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$")
 
 
@@ -67,6 +67,7 @@ class ScopeManifest:
     targets: tuple[str, ...]
     ports: tuple[int, ...]
     source_path: str = ""
+    web_urls: tuple[str, ...] = ()
 
     @property
     def active(self) -> bool:
@@ -102,22 +103,24 @@ def validate_scope_data(data: dict[str, Any], source_path: str = "", require_act
             ports.append(value)
     urls = data.get("web_urls", [])
     if not isinstance(urls, list) or len(urls) > MAX_TARGETS:
-        raise ValueError("web_urls must be a list with at most 1024 entries.")
+        raise ValueError("web_urls must be a list with at most 256 entries.")
     for value in urls:
         if not isinstance(value, str) or len(value) > 2048:
             raise ValueError("Each web URL must be a string no longer than 2048 characters.")
         parsed = urlsplit(value)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError(f"Invalid web URL {value!r}; expected http(s)://host.")
-        if parsed.username or parsed.password or parsed.fragment:
-            raise ValueError("Web URLs must not contain credentials or fragments.")
+        if parsed.username or parsed.password or parsed.fragment or parsed.query:
+            raise ValueError("Web URLs must not contain credentials, query strings, or fragments.")
+        if "\r" in value or "\n" in value:
+            raise ValueError("Web URLs must not contain line breaks.")
         target_host = normalize_target(parsed.hostname)
         if target_host not in targets and not _host_in_network(target_host, targets):
             raise ValueError(f"Web URL host {target_host!r} is not explicitly covered by targets.")
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         if port not in ports:
             raise ValueError(f"Web URL port {port} must also appear in ports.")
-    return ScopeManifest(name, owner, reference, expires_at, targets, tuple(ports), source_path)
+    return ScopeManifest(name, owner, reference, expires_at, targets, tuple(ports), source_path, tuple(dict.fromkeys(urls)))
 
 
 def _host_in_network(host: str, targets: tuple[str, ...]) -> bool:
@@ -143,3 +146,54 @@ def load_scope(path: str | Path, require_active: bool = True) -> ScopeManifest:
     except json.JSONDecodeError as exc:
         raise ValueError(f"Scope file is not valid JSON (line {exc.lineno}).") from exc
     return validate_scope_data(data, str(source), require_active=require_active)
+
+
+
+def create_scope_manifest(
+    path: str | Path,
+    *,
+    name: str,
+    owner: str,
+    authorization_reference: str,
+    expires_at: str,
+    targets: list[str],
+    ports: list[int],
+    web_urls: list[str] | None = None,
+) -> Path:
+    """Create a validated authorization manifest without contacting targets."""
+    destination = Path(path).expanduser()
+    if destination.exists():
+        raise ValueError(f"Refusing to overwrite existing scope file: {destination}")
+    data = {
+        "schema_version": 1,
+        "engagement": {
+            "name": name,
+            "owner": owner,
+            "authorization_reference": authorization_reference,
+            "expires_at": expires_at,
+        },
+        "targets": targets,
+        "ports": ports,
+        "web_urls": web_urls or [],
+    }
+    validated = validate_scope_data(data, source_path=str(destination), require_active=True)
+    normalized = {
+        "schema_version": 1,
+        "engagement": {
+            "name": validated.name,
+            "owner": validated.owner,
+            "authorization_reference": validated.authorization_reference,
+            "expires_at": validated.expires_at.isoformat(),
+        },
+        "targets": list(validated.targets),
+        "ports": list(validated.ports),
+        "web_urls": list(validated.web_urls),
+    }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text(json.dumps(normalized, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if destination.exists():
+        temporary.unlink(missing_ok=True)
+        raise ValueError(f"Refusing to overwrite existing scope file: {destination}")
+    temporary.replace(destination)
+    return destination.resolve()
