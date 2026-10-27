@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -279,7 +279,8 @@ def test_local_http_head_assessment_records_security_header_evidence(tmp_path):
         def log_message(self, format, *args):
             return
 
-    server = HTTPServer(("127.0.0.1", 0), FixtureHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+    server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     port = server.server_port
