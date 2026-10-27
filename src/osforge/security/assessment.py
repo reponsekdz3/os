@@ -22,7 +22,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from osforge.security.audit import append_event
-from osforge.security.approval import verify_scope_approval
+from osforge.security.approval import approval_signer_id, trusted_public_key_path, verify_scope_approval
 from osforge.security.contracts import AssessmentContext
 from osforge.security.plugins import evaluate_plugins, validate_plugin_selection
 from osforge.security.scope import ScopeManifest, load_scope
@@ -288,7 +288,6 @@ def run_assessment(
     scope_path: str | Path,
     *,
     approval_path: str | Path,
-    approval_public_key_path: str | Path,
     output_path: str | Path = "osforge-assessment-report.json",
     database_path: str | Path | None = None,
     audit_path: str | Path | None = None,
@@ -302,7 +301,10 @@ def run_assessment(
         raise ValueError(f"Refusing to overwrite existing assessment report: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     scope = load_scope(scope_path, require_active=True)
-    approval = verify_scope_approval(scope_path, approval_path, approval_public_key_path)
+    # Trust is resolved inside the engine too, so direct library callers cannot substitute an arbitrary key.
+    signer_id = approval_signer_id(approval_path)
+    trusted_key = trusted_public_key_path(signer_id)
+    approval = verify_scope_approval(scope_path, approval_path, trusted_key)
     # Reject unknown extension names before making any network request.
     validate_plugin_selection(plugin_names)
     if len(scope.web_urls) > MAX_WEB_URLS:

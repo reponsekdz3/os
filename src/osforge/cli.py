@@ -672,7 +672,6 @@ def dispatch_security(args: argparse.Namespace) -> int:
             report = run_assessment(
                 args.scope_file,
                 approval_path=args.approval,
-                approval_public_key_path=approval_key_path,
                 output_path=args.output,
                 database_path=args.db,
                 audit_path=args.audit_log,

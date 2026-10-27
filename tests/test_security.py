@@ -185,7 +185,7 @@ def test_unknown_plugin_rejected_before_assessment():
         validate_plugin_selection(("plugin-does-not-exist",))
 
 
-def test_local_assessment_persists_evidence_and_remediation(tmp_path):
+def test_local_assessment_persists_evidence_and_remediation(tmp_path, monkeypatch):
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -205,6 +205,7 @@ def test_local_assessment_persists_evidence_and_remediation(tmp_path):
         "web_urls": [],
     }), encoding="utf-8")
     approval_path, approval_key = approve_scope(scope_path, tmp_path, "tcp-run")
+    monkeypatch.setattr("osforge.security.assessment.trusted_public_key_path", lambda signer_id: approval_key)
     database = tmp_path / "state.sqlite3"
     audit = tmp_path / "audit.jsonl"
     report_path = tmp_path / "report.json"
@@ -212,7 +213,6 @@ def test_local_assessment_persists_evidence_and_remediation(tmp_path):
         report = run_assessment(
             scope_path,
             approval_path=approval_path,
-            approval_public_key_path=approval_key,
             output_path=report_path,
             database_path=database,
             audit_path=audit,
@@ -254,7 +254,6 @@ def test_local_assessment_persists_evidence_and_remediation(tmp_path):
         second = run_assessment(
             scope_path,
             approval_path=approval_path,
-            approval_public_key_path=approval_key,
             output_path=tmp_path / "report-2.json",
             database_path=database,
             audit_path=audit,
@@ -299,7 +298,7 @@ def test_scope_writer_creates_valid_manifest_without_overwrite(tmp_path):
         )
 
 
-def test_local_http_head_assessment_records_security_header_evidence(tmp_path):
+def test_local_http_head_assessment_records_security_header_evidence(tmp_path, monkeypatch):
     class FixtureHandler(BaseHTTPRequestHandler):
         def do_HEAD(self):
             self.send_response(200)
@@ -328,11 +327,11 @@ def test_local_http_head_assessment_records_security_header_evidence(tmp_path):
         "web_urls": [f"http://127.0.0.1:{port}/"],
     }), encoding="utf-8")
     approval_path, approval_key = approve_scope(scope_path, tmp_path, "http-run")
+    monkeypatch.setattr("osforge.security.assessment.trusted_public_key_path", lambda signer_id: approval_key)
     try:
         report = run_assessment(
             scope_path,
             approval_path=approval_path,
-            approval_public_key_path=approval_key,
             output_path=tmp_path / "http-report.json",
             database_path=tmp_path / "http-state.sqlite3",
             audit_path=tmp_path / "http-audit.jsonl",
@@ -379,6 +378,7 @@ def test_probe_budget_is_enforced_before_any_tcp_connection(tmp_path, monkeypatc
         "web_urls": [],
     }), encoding="utf-8")
     approval_path, approval_key = approve_scope(scope_path, tmp_path, "budget-run")
+    monkeypatch.setattr("osforge.security.assessment.trusted_public_key_path", lambda signer_id: approval_key)
     audit = tmp_path / "budget-audit.jsonl"
 
     def forbidden_connect(*args, **kwargs):
@@ -389,7 +389,6 @@ def test_probe_budget_is_enforced_before_any_tcp_connection(tmp_path, monkeypatc
         run_assessment(
             scope_path,
             approval_path=approval_path,
-            approval_public_key_path=approval_key,
             output_path=tmp_path / "should-not-exist.json",
             database_path=tmp_path / "budget.sqlite3",
             audit_path=audit,
@@ -462,7 +461,6 @@ def test_scope_approval_signature_required_before_any_network_io(tmp_path, monke
         run_assessment(
             scope_path,
             approval_path=tmp_path / "missing-approval.json",
-            approval_public_key_path=tmp_path / "missing-public-key.pem",
             output_path=tmp_path / "unsigned-report.json",
             database_path=tmp_path / "unsigned.sqlite3",
             audit_path=tmp_path / "unsigned-audit.jsonl",
