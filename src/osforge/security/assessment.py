@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from osforge.security.audit import append_event
 from osforge.security.approval import verify_scope_approval
@@ -238,7 +238,6 @@ def _web_check(
             if normalized in _SAFE_HEADERS:
                 safe_value = value.strip()[:600]
                 if normalized == "location":
-                    from urllib.parse import urljoin, urlsplit, urlunsplit
                     parsed_location = urlsplit(urljoin(safe_url, safe_value))
                     safe_value = urlunsplit((
                         parsed_location.scheme, parsed_location.netloc, parsed_location.path or "/", "", ""
