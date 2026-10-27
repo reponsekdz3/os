@@ -1,106 +1,106 @@
-# OS Forge — cross-platform terminal launcher
+# OS Forge — cross-platform terminal and defensive security workbench
 
-OS Forge is a real, extensible command-line workbench for **Windows, macOS, and Linux**. It combines a high-contrast terminal interface, host diagnostics, process and port inspection, network checks, command discovery, and native package-manager adapters in one launcher.
+OS Forge is a local command-line workbench for Windows, macOS, and Linux. It combines live host diagnostics and native terminal tools with local security-posture checks, authorization-scope validation, security-tool discovery, and an integrity-checked audit journal.
 
-It does not emulate an operating system, replace a kernel, or claim that every Linux command is native to Windows/macOS. It detects which tools really exist and invokes the host's native implementations. On Linux it supports Debian-family tools (apt/apt-get/dpkg), Red Hat-family tools (dnf/yum/rpm), and other common package managers. On macOS it supports Homebrew and MacPorts; on Windows it supports winget, Chocolatey, and Scoop when installed.
+OS Forge is a user-space workbench, not an operating-system replacement. It only has the privileges and network access available to the account running it.
 
 ## Install
 
-Requirements: Python 3.11 or newer. Open a normal terminal; administrator/root access is not required to inspect the machine.
+Requirements: Python 3.11 or newer.
 
-From a checkout:
-
+    git clone https://github.com/reponsekdz3/os.git
+    cd os
     python -m pip install -e .
     osforge
 
-Or start the module directly from the source tree:
+On Windows, use py -m pip install -e . if python is not on PATH.
 
-    python -m osforge
+For development and tests:
 
-Upgrade pip if your environment needs it:
-
-    python -m pip install --upgrade pip
     python -m pip install -e ".[dev]"
     python -m pytest
 
-## Quick commands
-
-Run these from your existing Windows Terminal, PowerShell, Command Prompt, macOS Terminal, or Linux terminal.
+## Core terminal commands
 
     osforge
     osforge info
     osforge doctor
-    osforge tools
-    osforge tools docker
+    osforge tools --all
     osforge processes
     osforge ports
     osforge net interfaces
     osforge net dns example.com
-    osforge net ping example.com
     osforge net check example.com 443
-    osforge pkg list
     osforge pkg search ripgrep
-    osforge pkg install ripgrep
-    osforge pkg remove ripgrep
-    osforge pkg update
     osforge shell
     osforge run git --version
 
-Package changes require a visible confirmation. Use the command's --yes option only when running a package action non-interactively; it does not grant administrator rights or bypass the host package manager's own restrictions. The program never auto-elevates itself.
+These commands use actual host data and native executables. Package changes request confirmation and use the platform's package manager.
 
-## Interactive launcher
+## Defensive security commands
 
-Start osforge with no arguments. The command prompt supports built-ins:
+### Local host posture
 
-- help — command reference
-- info — current OS, CPU, memory, disk, Python, and uptime details
-- doctor — diagnostics and detected package managers
-- tools [filter] — inspect which developer, administration, and security tools are installed
-- processes [limit] — list live processes
-- kill PID — request termination after showing the process identity and asking for confirmation
-- ports — inspect local listening TCP sockets
-- net interfaces — show network interfaces and addresses
-- net dns HOST — resolve a hostname through the system resolver
-- net ping HOST — send a small, bounded ping request
-- net check HOST PORT — check one explicitly supplied TCP endpoint
-- pkg list|search|install|remove|update — use a detected native package manager
-- run PROGRAM [ARG ...] — run a real executable directly, without a shell
-- shell — launch the user's normal interactive system shell
-- cd PATH — change the launcher's working directory
-- clear, exit
+    osforge security host-audit
+    osforge security host-audit --output host-posture.json
 
-Commands not built into the launcher can be invoked by name, such as git, python, ipconfig, PowerShell cmdlets via the PowerShell shell, or Linux tools available on the host. Use shell for pipelines, redirects, shell functions, and other shell syntax.
+The read-only host audit checks firewall state with native tools where possible, reviews selected Linux SSH configuration directives, inventories TCP listeners bound to wildcard interfaces, checks high memory pressure and home-directory permissions, and reports security-tool availability. Some checks may be incomplete without administrative visibility. Interpret findings in context.
+
+### Security tool inventory
+
+    osforge security tools
+
+This command discovers utilities such as Bandit, Trivy, Syft, Gitleaks, Semgrep, OSV-Scanner, Lynis, ClamAV, YARA, OSQuery, and platform-native administration tools. It reports whether executables are available on PATH; it does not bundle or automatically run them. Third-party extension metadata is listed without importing extension code.
+
+### Validate written authorization scope
+
+An authorization manifest records the approved targets and expiry for a security engagement. It does not independently prove that the operator has permission.
+
+Example scope.json:
+
+    {
+      "schema_version": 1,
+      "engagement": {
+        "name": "Internal network review",
+        "owner": "IT Security",
+        "authorization_reference": "CHANGE-1234",
+        "expires_at": "2027-01-30T18:00:00Z"
+      },
+      "targets": ["192.168.1.10", "example.org"],
+      "ports": [80, 443],
+      "web_urls": ["https://example.org"]
+    }
+
+Validate the manifest locally without connecting to any listed target:
+
+    osforge security validate-scope scope.json
+
+The validator checks expiry, target syntax, explicit ports, and that web URL hosts appear in the allowlist. Wildcard hosts are not accepted, and each IP network entry is limited to 256 addresses. This release validates the authorization record only; it does not perform a remote assessment.
+
+### Audit journal
+
+    osforge security audit-verify
+
+Security operations append local JSON Lines records under ~/.osforge/security-audit.jsonl. Entries are linked with SHA-256 hashes; verification detects edits or broken links. This is tamper-evident, not tamper-proof. For stronger evidence, forward events to centrally managed logging.
 
 ## Native package managers
 
-OS Forge chooses an available manager by platform unless --manager is supplied. Supported adapters are:
+- Windows: winget, Chocolatey, Scoop
+- macOS: Homebrew, MacPorts
+- Linux: apt, apt-get, dnf, yum, pacman, zypper, apk, Snap, Flatpak, Nix, and Portage
 
-- Windows: winget, choco, scoop
-- macOS: brew, port
-- Linux: apt, apt-get, dnf, yum, pacman, zypper, apk, snap, flatpak, nix-env, emerge
+A package manager must be installed and available on PATH. OS Forge invokes native executable argument arrays and does not silently elevate privileges.
 
-A manager must be installed and discoverable on PATH. OS Forge invokes native executable argument arrays rather than interpolating package names into a shell command. Install/remove/update commands can change the host and may require elevation; inspect the printed command and confirmation prompt first.
+## Extension model
 
-## Design guarantees
+Security utilities are discovered by capability and availability. Future plugins should have versioned metadata, declared permissions, input/output contracts, clear provenance, and explicit administrator trust decisions. Build the ecosystem around reviewed integrations instead of relying on huge, unverified collections.
 
-- Real host data and host processes; no simulated process lists, package installs, ports, or system status.
-- Cross-platform paths and command discovery.
-- Package names are passed as individual process arguments; no shell interpolation is used by package adapters.
-- Process termination requires an interactive confirmation and refuses to terminate the launcher itself.
-- Network checks require an explicit hostname and port; there is no built-in broad network scanner.
-- No hidden startup persistence, credential collection, telemetry, or silent system changes.
-- Automated tests run on Windows, macOS, and Ubuntu with supported Python versions in GitHub Actions.
+## Limitations
 
-## Scope and honest limits
+- Scope validation is a governance check, not a remote penetration test.
+- The platform does not perform indiscriminate discovery of devices on public networks.
+- No hidden telemetry or inventory uploads are performed by OS Forge.
+- Third-party tool behavior and accuracy remain the responsibility of each tool's publisher.
+- A clean report is not proof that a system is secure.
 
-OS Forge is a **launcher and system administration workbench**, not a new OS distribution or a privileged system service. It cannot make Windows a Debian installation or guarantee Linux-only tools such as systemd, rpm, dnf, or iproute2 are present on every machine. WSL, containers, virtual machines, and compatibility layers can provide additional environments when installed by the user. Availability and privileges remain those of the host.
-
-It intentionally does not apply broad machine-wide tweaks automatically. Use native host tools for specific configuration changes, review their effects, and make backups before changing system settings.
-
-## Development
-
-    python -m pip install -e ".[dev]"
-    python -m pytest
-    python -m osforge doctor
-
-See docs/SECURITY.md for the execution and safety model.
+See docs/SECURITY.md and tests/ for more details.

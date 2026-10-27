@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "osforge-terminal"
 version = "0.1.0"
-description = "A real cross-platform terminal launcher and host administration workbench"
+description = "Cross-platform terminal, host diagnostics, and defensive security workbench"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

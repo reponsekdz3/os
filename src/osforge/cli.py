@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import shutil
@@ -31,11 +32,15 @@ from osforge.packages import (
 from osforge.processes import list_processes, listening_ports, process_identity, terminate_process
 from osforge.system import doctor_checks, system_info
 from osforge.tools import TOOLS, discover_tools
+from osforge.security.audit import append_event, verify_log
+from osforge.security.catalog import discovered_tools, installed_security_extensions
+from osforge.security.posture import run_host_posture
+from osforge.security.scope import load_scope
 
 console = Console()
 BUILTINS = {
     "launch", "info", "doctor", "tools", "processes", "kill", "ports",
-    "net", "pkg", "run", "shell",
+    "net", "pkg", "run", "shell", "security",
 }
 
 
@@ -93,6 +98,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = commands.add_parser("run", help="run a real executable without a shell")
     run_parser.add_argument("argv", nargs=argparse.REMAINDER, help="program and arguments to execute")
+
+    security_parser = commands.add_parser("security", help="defensive security posture and local assessment tools")
+    security_commands = security_parser.add_subparsers(dest="security_command", required=True)
+
+    posture_parser = security_commands.add_parser("host-audit", help="run read-only local host posture checks")
+    posture_parser.add_argument("--output", help="optional JSON report destination")
+
+    security_commands.add_parser("tools", help="show detected defensive security tools and extensions")
+
+    scope_parser = security_commands.add_parser("validate-scope", help="validate an authorization manifest without contacting targets")
+    scope_parser.add_argument("scope_file", help="JSON file documenting approved targets, ports, owner, and expiry")
+
+    audit_parser = security_commands.add_parser("audit-verify", help="verify the local hash-linked audit journal")
+    audit_parser.add_argument("--path", help="optional audit log path; defaults to ~/.osforge/security-audit.jsonl")
 
     commands.add_parser("shell", help="open your normal interactive system shell")
     return parser
@@ -269,6 +288,110 @@ def launch_shell() -> int:
         return 126
 
 
+
+def dispatch_security(args: argparse.Namespace) -> int:
+    command = args.security_command
+    try:
+        if command == "host-audit":
+            report = run_host_posture()
+            append_event("host-audit.completed", details={
+                "hostname": report.get("host", {}).get("hostname", ""),
+                "findings_total": report.get("summary", {}).get("findings_total", 0),
+            })
+            summary = report["summary"]
+            console.print(Panel(
+                f"Host: [bright_cyan]{report['host']['hostname']}[/bright_cyan]\n"
+                f"Platform: {report['host']['platform']}\n"
+                f"Elevated process: {report['host']['elevated']}\n"
+                f"Findings: {summary['findings_total']}  |  "
+                f"Medium: {summary['findings_by_severity']['medium']}  |  "
+                f"Low: {summary['findings_by_severity']['low']}",
+                title="OS FORGE SECURITY / LOCAL POSTURE",
+                border_style="bright_green",
+            ))
+            table = Table(title="READ-ONLY HOST FINDINGS", box=box.SIMPLE_HEAVY)
+            table.add_column("SEVERITY", style="bright_cyan")
+            table.add_column("CHECK")
+            table.add_column("STATUS")
+            table.add_column("FINDING")
+            table.add_column("EVIDENCE / NEXT STEP", overflow="fold")
+            for item in report["findings"]:
+                severity = item["severity"].upper()
+                table.add_row(
+                    severity, item["check_id"], item["status"], item["title"],
+                    (item["evidence"] + "\nRemediation: " + item["remediation"])[:1200],
+                )
+            console.print(table)
+            if args.output:
+                destination = Path(args.output).expanduser().resolve()
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                temporary = destination.with_suffix(destination.suffix + ".tmp")
+                temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                temporary.replace(destination)
+                console.print(f"[green]JSON report written:[/green] {destination}")
+            return 0
+
+        if command == "tools":
+            table = Table(title="DEFENSIVE SECURITY TOOLCHAIN / LIVE PATH DISCOVERY", box=box.SIMPLE_HEAVY)
+            table.add_column("TOOL", style="bright_cyan")
+            table.add_column("CATEGORY")
+            table.add_column("STATUS")
+            table.add_column("EXECUTABLE")
+            for tool, path in discovered_tools():
+                table.add_row(
+                    tool.name, tool.category,
+                    "[green]FOUND[/green]" if path else "[dim]NOT FOUND[/dim]",
+                    path or "—",
+                )
+            console.print(table)
+            installed = installed_security_extensions()
+            console.print(f"{sum(1 for _, path in discovered_tools() if path)} of {len(discovered_tools())} catalogued tools found on PATH.")
+            if installed:
+                ext = Table(title="INSTALLED OS FORGE EXTENSION METADATA (NOT EXECUTED)", box=box.SIMPLE)
+                ext.add_column("NAME", style="bright_cyan")
+                ext.add_column("ENTRY POINT")
+                for name, entry in installed:
+                    ext.add_row(name, entry)
+                console.print(ext)
+            console.print("[dim]Discovery does not import or execute third-party extension code.[/dim]")
+            return 0
+
+        if command == "validate-scope":
+            scope = load_scope(args.scope_file, require_active=True)
+            append_event("scope-validated", details={
+                "scope_file": scope.source_path,
+                "authorization_reference": scope.authorization_reference,
+                "target_count": len(scope.targets),
+                "port_count": len(scope.ports),
+            })
+            table = Table(title="AUTHORIZATION MANIFEST / VALIDATION", box=box.ROUNDED)
+            table.add_column("FIELD", style="bright_cyan")
+            table.add_column("VALUE", overflow="fold")
+            table.add_row("Engagement", scope.name)
+            table.add_row("Owner", scope.owner)
+            table.add_row("Authorization reference", scope.authorization_reference)
+            table.add_row("Expires (UTC)", scope.expires_at.isoformat())
+            table.add_row("Active", "yes" if scope.active else "no")
+            table.add_row("Explicit targets", "\n".join(scope.targets))
+            table.add_row("Allowed TCP ports", ", ".join(str(p) for p in scope.ports))
+            table.add_row("Manifest", scope.source_path)
+            console.print(table)
+            console.print("[yellow]Validation checks the manifest's structure and expiry only; it does not prove ownership or consent.[/yellow]")
+            return 0
+
+        if command == "audit-verify":
+            valid, count, message = verify_log(args.path)
+            if valid:
+                console.print(f"[green]{message}[/green]")
+                return 0
+            console.print(f"[bold red]Audit-log verification failed:[/bold red] {message}")
+            return 1
+        console.print("[red]Unknown security command.[/red]")
+        return 2
+    except (ValueError, RuntimeError, PermissionError, OSError) as exc:
+        console.print(f"[bold red]SECURITY ERROR[/bold red] {exc}")
+        return 1
+
 def dispatch(args: argparse.Namespace) -> int:
     command = args.command
     try:
@@ -326,6 +449,8 @@ def dispatch(args: argparse.Namespace) -> int:
             return _run_package_action(args)
         if command == "run":
             return _run_external(args.argv)
+        if command == "security":
+            return dispatch_security(args)
         if command == "shell":
             return launch_shell()
         console.print("[red]Unknown command. Use osforge --help.[/red]")
